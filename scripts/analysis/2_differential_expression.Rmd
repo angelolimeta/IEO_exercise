@@ -1,0 +1,421 @@
+---
+title: "Differential expression analysis"
+author: "Angelo Limeta"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    theme: "journal"
+editor_options:
+  chunk_output_type: inline
+always_allow_html: true
+---
+
+
+## Load Libraries
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+
+library(tidyverse)
+library(ggrepel)
+library(tidyHeatmap)
+
+library(edgeR)
+library(piano)
+
+select = dplyr::select
+```
+## Plot settings
+```{r}
+# Use colourblind-friendly colours
+friendly_cols <- dittoSeq::dittoColors()
+
+# Set theme
+custom_theme <-
+  list(
+    scale_fill_manual(values = friendly_cols),
+    scale_color_manual(values = friendly_cols),
+    theme_bw() +
+      theme(
+        panel.border = element_blank(),
+        axis.line = element_line(),
+        panel.grid.major = element_line(linewidth = 0.2),
+        panel.grid.minor = element_line(linewidth = 0.1),
+        text = element_text(size = 12),
+        legend.position = "bottom",
+        strip.background = element_blank(),
+        axis.title.x = element_text(margin = margin(t = 10, r = 10, b = 10, l = 10)),
+        axis.title.y = element_text(margin = margin(t = 10, r = 10, b = 10, l = 10)),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)
+      )
+  )
+```
+
+## Load data
+```{r}
+tbl_meta <- readRDS(file = "../../results/processed_data/tbl_meta.rds")
+tbl_rna <- readRDS(file = "../../results/processed_data/tbl_rna.rds")
+```
+
+## Preprocessing
+
+Let's begin by combining counts and metadata and add annotations per gene
+```{r}
+# Merge metadata and counts and annotate transcripts with gene symbol
+tbl_full <- tbl_meta %>%
+  right_join(tbl_rna, by = "sample_id") %>% 
+  mutate(
+    # Remove the version numbers from the transcript IDs
+    target_id_clean = str_remove(target_id, "\\..*"),
+    
+    # Map transcript IDs to gene symbols
+    symbol = mapIds(
+      org.Hs.eg.db,
+      keys = target_id_clean,
+      keytype = "ENSEMBLTRANS",
+      column = "SYMBOL",
+      multiVals = "first"
+    )
+  )
+```
+
+Let's now remove transcripts with no mapping and sum up all transcripts per gene symbol.
+We will use tidybulk for the analysis so let's convert it to the appropriate object type.
+```{r}
+tbl_gene_level <- 
+  tbl_full %>%
+  filter(!is.na(symbol)) %>%
+  group_by(symbol, sample_id) %>%
+  summarise(
+    est_counts = sum(est_counts, na.rm = TRUE),
+  ) %>%
+  ungroup() %>% 
+  left_join(tbl_meta, by = "sample_id") %>% 
+  select(sample_id,method,condition,symbol,est_counts) %>% 
+  mutate(condition = as.factor(as.character(condition)))
+
+head(tbl_gene_level)
+
+# Check number of genes:
+tbl_gene_level %>% select(symbol) %>% distinct() %>% nrow()
+```
+
+## Differential expression
+
+
+We will begin by performing the standard steps in the edgeR pipeline
+```{r}
+# Summarize counts by gene and sample
+tbl_counts <- tbl_gene_level %>%
+  select(sample_id, symbol, est_counts) %>%
+  pivot_wider(names_from = sample_id, values_from = est_counts) # Wide format
+
+# Prepare the design matrix
+design <- tbl_gene_level %>%
+  select(sample_id, condition) %>%
+  distinct() %>%
+  mutate(condition = factor(condition, levels = c("scr", "kd"),ordered = T))  # Ensure "scr" is baseline
+
+# Convert tibble to matrix for edgeR
+count_matrix <- tbl_counts %>%
+  column_to_rownames("symbol") %>%  # Set the gene symbols as row names
+  as.matrix()
+
+# Ensure sample order matches between the design and counts matrix
+stopifnot(all(colnames(count_matrix) == design$sample_id))
+
+# Create DGEList object
+dge <- DGEList(counts = count_matrix, group = design$condition)
+
+# Filter out lowly expressed genes
+# Keep genes with at least 1 count per million (CPM) in at least 2 samples
+keep <- filterByExpr(dge)
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+
+# Normalize the data using TMM normalization
+dge <- calcNormFactors(dge)
+
+# Estimate dispersions
+dge <- estimateDisp(dge, design = model.matrix(~condition, data = design))
+
+# Fit the GLM
+fit <- glmFit(dge, design = model.matrix(~condition, data = design))
+
+# Perform likelihood ratio test to find differentially expressed genes
+lrt <- glmLRT(fit)
+
+# Summarize the results
+top_genes <- topTags(lrt, n = Inf)  # n = Inf returns all genes
+
+# Add FDR column for significance cutoff
+top_genes_tbl <- as_tibble(top_genes$table) %>%
+  mutate(gene = rownames(top_genes$table)) %>%
+  arrange(FDR)  # Sort by FDR (False Discovery Rate)
+
+# Output results
+print(head(top_genes_tbl, 20))  # View top 20 differentially expressed genes
+
+# Save results to a file
+write_csv(top_genes_tbl, file = "../../results/tables/differential_expression_results.csv")
+```
+
+Let's do some routine visualizations. We can begin with a volcano plot of the genes.
+```{r,fig.height=6,fig.width=6}
+# Define fold change and FDR thresholds
+fold_change_threshold <- 1
+fdr_threshold <- 0.05
+
+p_volcano <- 
+  top_genes_tbl %>%
+  ggplot(aes(x = logFC, y = -log10(FDR), label = gene)) +
+  
+  # Add points with color by significance
+  geom_point(aes(color = FDR < fdr_threshold & abs(logFC) > fold_change_threshold), 
+             alpha = 0.7, size = 2) +
+  
+  # Vertical lines for fold-change thresholds
+  geom_vline(xintercept = c(-fold_change_threshold, fold_change_threshold), 
+             linetype = "dashed", color = "darkred", size = 0.8) +
+  
+  # Horizontal line for FDR threshold
+  geom_hline(yintercept = -log10(fdr_threshold), 
+             linetype = "dashed", color = "blue", size = 0.8) +
+  
+  # Highlight top 10 most significant genes with labels
+  geom_text_repel(
+    data = top_genes_tbl %>% arrange(FDR) %>% slice(1:10),
+    aes(label = gene), 
+    size = 4, 
+    box.padding = 0.5, 
+    point.padding = 0.5,
+    max.overlaps = 10, 
+    segment.color = 'black',  # Black line for clear connection
+    segment.size = 0.5,       # Thinner lines for clarity
+    segment.curvature = -0.2, # Slightly curved segments for aesthetics
+    segment.angle = 90        # Make the lines stand out vertically
+  ) +
+  
+  # Customize color scale
+  scale_color_manual(values = c("gray50", "red")) +
+  
+  # Titles and labels
+  labs(
+    title = "Volcano Plot of Differential Gene Expression",
+    x = "Log2 Fold Change",
+    y = "-Log10 FDR",
+    color = "Significant"
+  ) +
+  
+  # Customize theme
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",  # Hide legend for simplicity
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+p_volcano
+
+# Save plot to file
+ggsave(plot = p_volcano,filename = "../../results/figures/dge_volcano.pdf")
+```
+
+Let's make a heatmap of the top differentially expressed genes
+```{r,fig.width=4, fig.height=6}
+# Extract TMM-normalized counts (CPM) from the DGEList object
+cpm_tmm <- cpm(dge, normalized.lib.sizes = TRUE, log = FALSE)
+
+# Convert the CPM matrix to a tibble
+tbl_cpm <- as_tibble(cpm_tmm, rownames = "symbol") %>%
+  pivot_longer(cols = -symbol, names_to = "sample_id", values_to = "cpm")
+
+# Join with metadata to include condition and method information
+tbl_cpm_with_meta <- tbl_cpm %>%
+  left_join(tbl_meta, by = "sample_id")
+
+# Select top 50 genes for example purposes
+top_50_genes <- top_genes_tbl %>% 
+  arrange(FDR) %>% 
+  slice_head(n=50) %>% 
+  pull(gene)
+
+tbl_top_50 <- tbl_cpm_with_meta %>%
+  filter(symbol %in% top_50_genes)
+
+# Create heatmap using tidyheatmap
+p_heatmap <- 
+  tbl_top_50 %>%
+  mutate(condition = as.character(condition)) %>% 
+  heatmap(
+    .row = symbol,
+    .column = sample_id,
+    .value = cpm,
+    scale = "row"
+  ) %>% 
+  add_tile(.column = condition, palette = c("grey80","darkred"))
+
+p_heatmap
+
+# Save plot to file
+save_pdf(.heatmap = p_heatmap,filename = "../../results/figures/dge_heatmap.pdf",width = 4,height = 6)
+
+```
+
+Plot top 12 genes
+```{r}
+# Select top 12 genes
+top_12_genes <- top_genes_tbl %>% 
+  arrange(FDR) %>% 
+  slice_head(n=12) %>% 
+  pull(gene)
+
+# Filter and plot in facets
+p_top12_dge <- 
+  tbl_cpm_with_meta %>%
+  filter(symbol %in% top_12_genes) %>% 
+  ggplot(aes(x = condition,y = cpm, color = condition)) +
+  geom_jitter() +
+  facet_wrap(vars(symbol),scales = "free_y") +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = c("grey80","darkred"))
+
+p_top12_dge
+
+# Save plot to file
+ggsave(plot = p_top12_dge, filename = "../../results/figures/dge_top12genes.pdf")
+```
+
+I guess that this is breast cancer cells, but let's verify the cell type.
+
+**Let's check the expression of these genes:**
+
+- **ESR1**: Encodes the estrogen receptor, primarily involved in the regulation of estrogen-responsive genes.
+- **PGR**: Encodes the progesterone receptor, which is involved in the response to progesterone hormone signaling.
+- **ERBB2**: Encodes the HER2 protein, a member of the epidermal growth factor receptor family, often associated with cell growth and differentiation.
+- **GATA3**: A transcription factor crucial for the development and differentiation of luminal cells in breast tissue.
+- **FOXA1**: A transcription factor that plays a role in estrogen receptor signaling and breast cancer cell differentiation.
+- **KRT18**: Encodes keratin 18, a marker for luminal epithelial cells in various tissues, including breast tissue.
+- **KRT14**: Encodes keratin 14, often found in basal epithelial cells, playing a role in structural integrity.
+```{r}
+brca_markers <- c("ESR1", "PGR", "ERBB2", "GATA3", "FOXA1", "KRT18","KRT14")
+
+p_markers_brca <- 
+  tbl_cpm_with_meta %>%
+  filter(symbol %in% brca_markers) %>% 
+  ggplot(aes(x = condition,y = cpm, color = condition)) +
+  geom_jitter() +
+  facet_wrap(vars(symbol),scales = "free_y") +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = c("grey80","darkred"))
+
+p_markers_brca
+
+# Save plot to file
+ggsave(plot = p_markers_brca, filename = "../../results/figures/dge_brca_markers.pdf")
+```
+Only **FOXA1** and **KRT14** were detected in the dataset. The absence of **ESR1**, **PGR**, and **ERBB2** suggests that key markers related to hormone receptor status are not expressed. This lack of receptor markers, alongside the presence of **KRT14**, which is associated with basal-like characteristics, hints that these cells could potentially be from **triple-negative breast cancer (TNBC)**.
+
+
+Now let's focus on the potential knockdown, let's see the raw values for the top 2 genes:
+
+- **CLDN7** (Claudin-7): Claudins are essential components of tight junctions, which regulate paracellular transport in epithelial tissues. CLDN7 has been linked to cancer progression and metastasis, and its altered expression has been observed in breast cancer, including TNBC (https://doi.org/10.21873%2Finvivo.11238).
+
+- **TACSTD2** (Tumor-associated calcium signal transducer 2, aka Trop2): TACSTD2 is a cell surface glycoprotein implicated in cell proliferation and survival. It has been linked to poor prognosis in several cancers, including breast cancer, and plays a role in promoting tumor growth and metastasis in aggressive subtypes like TNBC (https://doi.org/10.1038/s41523-021-00341-6).
+```{r}
+tbl_cpm_with_meta %>% 
+  filter(symbol %in% c("CLDN7","TACSTD2"))
+```
+
+Based on the drastic reduction in TACST2 expression, and it's somewhat more clear role in metastasis, I'd think that this would be the target gene in the knockdown experiment.
+
+Either way, let's also check the expression of all claudins to check their expression levels.
+```{r}
+
+p_claudins <- 
+  tbl_cpm_with_meta %>%
+  filter(grepl("CLDN",symbol)) %>% 
+  ggplot(aes(x = condition,y = cpm, color = condition)) +
+  geom_jitter() +
+  facet_wrap(vars(symbol),scales = "free_y") +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = c("grey80","darkred"))
+
+p_claudins
+
+# Save plot to file
+ggsave(plot = p_claudins, filename = "../../results/figures/dge_claudins.pdf")
+```
+Looks like lots of these aren't even expressed.
+
+Now we can check processes that are changed using gene set enrichment with Piano
+```{r}
+# Load gene set (Cancer hallmarks)
+hallmarks_gsc = loadGSC(file = "../../data/gene_sets/h.all.v2024.1.Hs.symbols.gmt")
+
+# Extract FDR adjusted pvalues and log2 fold-changes
+padj = top_genes_tbl %>% 
+  pull(FDR)
+
+log2fc = top_genes_tbl %>% 
+  pull(logFC)
+
+names(padj) = top_genes_tbl %>% 
+  pull(gene)
+
+names(log2fc) = top_genes_tbl %>% 
+  pull(gene)
+cat("p-values \n")
+head(padj)
+cat("\nlog2-FC \n")
+head(log2fc)
+
+# Run Piano
+gsaRes <- runGSA(padj,
+                 log2fc,
+                 gsc=hallmarks_gsc,
+                 ncpus=8,
+                 signifMethod = "geneSampling",
+                 nPerm = 10000
+                 )
+```
+
+Plot gene set analysis heatmap
+```{r,fig.width=8,fig.height=10}
+GSAheatmap(gsaRes,cex = 0.8,ncharLabel = Inf)
+
+```
+
+
+Looks like we have downregulation of:
+
+- **TNFalpha signaling**
+- **KRAS signaling**
+- **Estrogen response**
+
+and upregulation of:
+
+- **EMT**
+- **KRAS SIGNALING**
+- **INFgamma respose**
+- **Adipogenessis**
+- **Oxidative phosphorylation**
+
+Looks like this knockdown seems to promote metastasis!
+
+
+
+# Save data objects of interest
+```{r}
+saveRDS(object = tbl_cpm_with_meta,file = "../../results/processed_data/tbl_cp_with_meta.rds")
+saveRDS(object = top_genes_tbl,file = "../../results/processed_data/tbl_top_genes.rds")
+```
+
+
+

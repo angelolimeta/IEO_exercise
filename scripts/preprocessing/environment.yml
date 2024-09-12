@@ -1,0 +1,26 @@
+name: sequencing_analysis
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.8
+  - fastqc
+  - multiqc
+  - trimmomatic
+  - cutadapt
+  - bowtie2
+  - bwa
+  - samtools
+  - hisat2
+  - star
+  - macs2
+  - deeptools
+  - subread
+  - fastp
+  - r-base
+  - bioconductor-deseq2
+  - bioconductor-edger
+  - r-ggplot2
+  - r-pheatmap
+  - nextflow

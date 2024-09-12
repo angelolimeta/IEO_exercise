@@ -1,0 +1,133 @@
+---
+title: "Process to tidy data"
+author: "Angelo Limeta"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    theme: "journal"
+editor_options:
+  chunk_output_type: inline
+always_allow_html: true
+---
+
+
+
+This script will convert everything into rds files for easy loading later on.
+
+Load libraries and set path
+```{r}
+library(tidyverse)
+```
+
+## Create metadata
+```{r}
+tbl_meta <-
+  tibble(sample_id = c("S57532", "S57533", "S45085", "S45086", "S45028","S45030","S42155","S42156"),
+         method = c("chip_seq","chip_seq","chip_seq","chip_seq","rna_seq","rna_seq","rna_seq","rna_seq"),
+         condition = factor(c("scr", "kd","scr", "kd","scr", "kd","scr", "kd"),levels = c("scr","kd"),ordered = T))
+
+glimpse(tbl_meta)
+```
+
+
+## Load ChIP data
+```{r}
+# Define file paths for the narrowPeak files
+chip_seq_files <- list.files(path = "../../results/chip_data/macs2/", pattern = "*.narrowPeak", full.names = TRUE)
+
+# Create a function to load each narrowPeak file and add sample_id
+load_chip_data <- function(file) {
+  sample_id <- str_replace(basename(file), "_peaks.narrowPeak", "")
+  read_tsv(file, col_names = FALSE) %>%
+    mutate(sample_id = sample_id) %>%
+    rename(
+      chrom = X1,
+      chromStart = X2,
+      chromEnd = X3,
+      name = X4,
+      score = X5,
+      strand = X6,
+      signalValue = X7,
+      pValue = X8,
+      qValue = X9,
+      peak = X10
+    )
+}
+
+# Combine all ChIP-seq data into a single tibble
+tbl_chip <- tibble()
+for (file in chip_seq_files) {
+  tbl_file <- read_tsv(file, col_names = FALSE) %>%
+    rename(
+      chrom = X1,
+      chromStart = X2,
+      chromEnd = X3,
+      name = X4,
+      score = X5,
+      strand = X6,
+      signalValue = X7,
+      pValue = X8,
+      qValue = X9,
+      peak = X10
+    )
+  sample <- gsub(".*macs2_output_","",file)
+  sample <- gsub("_ID.*","",sample)
+  tbl_file <- tbl_file %>% 
+    mutate(sample_id = sample) %>% 
+    relocate(sample_id, .before = "chrom")
+  
+  tbl_chip <- bind_rows(tbl_chip,tbl_file)
+
+}
+```
+
+```{r}
+glimpse(tbl_chip)
+summary(tbl_chip)
+```
+
+## Load RNA-seq data
+```{r}
+# Define file paths for the Kallisto abundance.tsv files
+rna_seq_dirs <- list.dirs(path = "../../results/rna_data/kallisto/", full.names = TRUE, recursive = FALSE)
+
+# Create a function to load each abundance.tsv file and add sample_id
+load_rna_data <- function(dir) {
+  sample_id <- basename(dir)
+  read_tsv(file.path(dir, "abundance.tsv")) %>%
+    mutate(sample_id = sample_id) %>%
+    rename(
+      target_id = `target_id`,
+      length = `length`,
+      eff_length = `eff_length`,
+      est_counts = `est_counts`,
+      tpm = `tpm`
+    )
+}
+
+# Combine all RNA-seq data into a single tibble
+tbl_rna <- tibble()
+for (dir in rna_seq_dirs) {
+  tbl_file <- load_rna_data(dir) %>% 
+    mutate(sample_id = gsub("_I.*","",sample_id))
+  tbl_rna <- bind_rows(tbl_rna, tbl_file)
+}
+
+```
+
+
+```{r}
+glimpse(tbl_rna)
+summary(tbl_rna)
+```
+
+## Save data
+```{r}
+saveRDS(tbl_meta,file = "../../results/processed_data/tbl_meta.rds")
+saveRDS(tbl_chip,file = "../../results/processed_data/tbl_chip.rds")
+saveRDS(tbl_rna,file = "../../results/processed_data/tbl_rna.rds")
+```
+
