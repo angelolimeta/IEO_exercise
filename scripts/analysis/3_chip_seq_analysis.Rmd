@@ -1,0 +1,537 @@
+---
+title: "Chip seq analysis"
+author: "Angelo Limeta"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    theme: "journal"
+editor_options:
+  chunk_output_type: inline
+always_allow_html: true
+---
+
+
+## Load Libraries
+```{r}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(biomaRt)
+
+library(tidyverse)
+library(ggrepel)
+library(tidyHeatmap)
+
+library(GenomicRanges)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+select = dplyr::select
+```
+
+## Load data
+```{r}
+tbl_meta <- readRDS(file = "../../results/processed_data/tbl_meta.rds")
+tbl_chip <- readRDS(file = "../../results/processed_data/tbl_chip.rds")
+
+head(tbl_chip)
+head(tbl_meta)
+```
+## Check the event distribution
+
+Let's plot peaks across chromosomes and samples.
+
+```{r}
+# Specify chip samples
+chip_samples <- tbl_meta %>% filter(method == "chip_seq") %>% pull(sample_id)
+
+# Ensure chromosomes are ordered correctly (numerically and X/Y at the end)
+tbl_chip_ordered <- tbl_chip %>%
+  mutate(
+    chrom = factor(chrom, levels = c(paste0("chr", 1:22), "chrX", "chrY"))
+  ) %>%
+  filter(!is.na(chrom))  # Remove non-standard chromosomes
+
+# Define a two-color palette to alternate between chromosomes
+two_color_palette <- c("#1f77b4", "#ff7f0e")  # Blue and orange
+
+# Assign alternating colors to chromosomes
+tbl_chip_ordered <- tbl_chip_ordered %>%
+  mutate(chrom_color = as.factor(as.numeric(chrom) %% 2 + 1))  # Alternate colors
+
+# Plot the Manhattan plots
+for (id in chip_samples) {
+  plot <- tbl_chip_ordered %>%
+    filter(sample_id == id) %>%
+    ggplot(aes(x = chromStart, y = qValue, color = chrom_color)) +
+    geom_point(alpha = 0.6, size = 0.6) +
+
+    facet_wrap(~ chrom, scales = "free_x", nrow = 2) +
+    
+    # Add labels and titles
+    labs(
+      title = paste0("Manhattan Plot for ", id),
+      x = "Genomic Position",
+      y = "q-value"
+    ) +
+    theme_classic() +
+    theme(
+      legend.position = "none",  # Remove legend for simplicity
+      strip.background = element_blank(),  # Remove background from facet labels
+      strip.text = element_text(size = 10, face = "bold"),  # Bold facet labels
+      axis.title = element_text(size = 12),  # Increase axis title size
+      axis.text.x = element_blank(),  # Hide x-axis text
+      axis.ticks.x = element_blank()  # Hide x-axis ticks
+    ) +
+    # Use the two-color palette for chromosomes
+    scale_color_manual(values = two_color_palette)
+  
+  print(plot)
+  ggsave(plot = plot, filename = paste0("../../results/figures/chip_chrom_peaks_",id,".pdf"))
+}
+
+
+
+```
+
+
+## Differential peak analysis
+
+
+We begin by loading the macs2 outputs, and then let's merge overlapping peaks
+```{r}
+# Define file paths for the narrowPeak files
+chip_seq_files <- list.files(path = "../../results/chip_data/macs2/", pattern = "*.narrowPeak", full.names = TRUE)
+
+# Load and combine peaks
+load_chip_data <- function(file) {
+  sample_id <- str_replace(basename(file), "_peaks.narrowPeak", "")
+  sample_id <- gsub(".*macs2_output_","",sample_id)
+  sample_id <- gsub("_ID.*","",sample_id)
+  read_tsv(file, col_names = FALSE) %>%
+    mutate(sample_id = sample_id) %>%
+    rename(
+      chrom = X1,
+      chromStart = X2,
+      chromEnd = X3,
+      name = X4,
+      score = X5,
+      strand = X6,
+      signalValue = X7,
+      pValue = X8,
+      qValue = X9,
+      peak = X10
+    )
+}
+
+# Combine all narrowPeak files into a single tibble
+tbl_chip <- bind_rows(lapply(chip_seq_files, load_chip_data))
+
+# Create a list of GRanges objects, one for each sample
+granges_list <- tbl_chip %>%
+  split(.$sample_id) %>%
+  map(~GRanges(
+    seqnames = .$chrom, 
+    ranges = IRanges(start = .$chromStart, end = .$chromEnd),
+    signalValue = .$signalValue  # Assuming this is the score you'd like to retain
+  ))
+
+# Combine all GRanges objects into a single GRangesList
+granges_combined <- GRangesList(granges_list)
+
+# Flatten the GRangesList into a single GRanges object
+granges_flat <- unlist(granges_combined)
+
+# Now reduce the flattened GRanges object to merge overlapping peaks
+merged_peaks <- reduce(granges_flat)
+```
+
+Now we will create a signal matrix, i.e. rows corresponding to merged peaks and columns for samples
+```{r}
+# Initialize an empty matrix to store signal values (one row per merged peak, one column per sample)
+score_matrix <- matrix(NA, nrow = length(merged_peaks), ncol = length(granges_list))
+colnames(score_matrix) <- names(granges_list)  # Set sample names as column names
+
+# Fill the matrix with signal values based on overlaps
+for (i in seq_along(granges_list)) {
+  sample_gr <- granges_list[[i]]
+  overlaps <- findOverlaps(merged_peaks, sample_gr)
+  
+  # Fill in the signal values for the peaks that overlap
+  score_matrix[queryHits(overlaps), i] <- sample_gr$signalValue[subjectHits(overlaps)]
+}
+
+# Convert the matrix to a data frame for easier manipulation later
+score_df <- as.data.frame(score_matrix)
+colnames(score_df) <- names(granges_list)
+
+# Add peak information (chromosome, start, end) to the score matrix
+merged_peaks_df <- as.data.frame(merged_peaks)
+score_df <- cbind(merged_peaks_df, score_df)
+
+# Preview the final score data frame
+head(score_df)
+
+```
+
+
+```{r}
+# Add condition information to the score matrix (from tbl_meta)
+sample_conditions <- tbl_meta %>%
+  filter(sample_id %in% colnames(score_matrix)) %>%
+  arrange(match(sample_id, colnames(score_matrix))) %>%
+  pull(condition)
+
+# Initialize vectors to store p-values and logFC
+p_values <- rep(NA, nrow(score_matrix))
+log_fc <- rep(NA, nrow(score_matrix))  # Initialize for logFC
+
+# Loop through each row (peak) in the score matrix
+for (i in 1:nrow(score_matrix)) {
+  # Get the signal values for the current peak
+  row <- score_matrix[i, ]
+  
+  # Separate the values by condition (scr vs kd)
+  scr_values <- row[sample_conditions == "scr"]
+  kd_values <- row[sample_conditions == "kd"]
+  
+  # Check if there are enough non-NA values in both conditions
+  if (sum(!is.na(scr_values)) > 1 && sum(!is.na(kd_values)) > 1) {
+    # Perform the t-test and store the p-value
+    p_values[i] <- t.test(scr_values, kd_values)$p.value
+    
+    # Calculate log2 fold change (logFC) if both conditions have non-zero means
+    if (mean(scr_values, na.rm = TRUE) > 0 && mean(kd_values, na.rm = TRUE) > 0) {
+      log_fc[i] <- log2(mean(kd_values, na.rm = TRUE) / mean(scr_values, na.rm = TRUE))
+    } else {
+      log_fc[i] <- NA  # Avoid log transformation issues with zero means
+    }
+  } else {
+    p_values[i] <- NA  # Store NA if not enough data points
+    log_fc[i] <- NA  # Also store NA for logFC in these cases
+  }
+}
+
+# Adjust p-values for multiple testing using the Benjamini-Hochberg method (FDR)
+adjusted_p_values <- p.adjust(p_values, method = "BH")
+
+# Add p-values, adjusted p-values, and logFC to the score_df
+score_df$p_value <- p_values
+score_df$adj_p_value <- adjusted_p_values
+score_df$logFC <- log_fc
+
+# Sort by p-value to find the most significant differential peaks
+score_df <- score_df %>%
+  arrange(p_value) %>% 
+  filter(!is.na(p_value))
+
+# Preview the top differentially enriched peaks with logFC
+head(score_df)
+
+
+
+```
+
+
+Let's annotate the peaks so we know which genes are connected to it.
+
+We will use ChipSeeker for this.
+```{r}
+# Convert the merged peaks back to a GRanges object from score_df
+granges_peaks <- GRanges(
+  seqnames = score_df$seqnames, 
+  ranges = IRanges(start = score_df$start, end = score_df$end)
+)
+
+# Annotate peaks with ChIPseeker
+peak_annotation <- annotatePeak(
+  granges_peaks, 
+  TxDb = TxDb.Hsapiens.UCSC.hg38.knownGene, 
+  annoDb = "org.Hs.eg.db"
+)
+
+# Convert the annotated peaks to a data frame
+annotated_df <- as.data.frame(peak_annotation)
+
+# Merge the annotation with the score_df based on peak location
+score_df_annotated <- score_df %>%
+  mutate(peak_id = paste(seqnames, start, end, sep = "_")) %>%
+  left_join(annotated_df %>% 
+              mutate(peak_id = paste(seqnames, start, end, sep = "_")), 
+            by = "peak_id") %>% 
+  select(-c( "seqnames.y","start.y","end.y","width.y","strand.y"))
+
+# Preview the annotated peaks with gene symbols
+head(score_df_annotated)
+```
+
+Let's plot the top differentially expressed peaks in a volcano plot
+```{r}
+
+
+# Define thresholds for significance (logFC and raw p-values)
+logfc_threshold <- 1  # Log2 fold change threshold
+pval_threshold <- 0.05  # Raw p-value threshold
+
+# Select the top 10 upregulated and top 10 downregulated peaks based on raw p-values
+top_upregulated <- score_df_annotated %>%
+  filter(logFC > logfc_threshold, p_value < pval_threshold) %>%
+  arrange(p_value) %>%
+  slice(1:10)
+
+top_downregulated <- score_df_annotated %>%
+  filter(logFC < -logfc_threshold, p_value < pval_threshold) %>%
+  arrange(p_value) %>%
+  slice(1:10)
+
+# Combine top upregulated and downregulated peaks for labeling
+top_peaks <- bind_rows(top_upregulated, top_downregulated)
+
+# Volcano plot using raw p-values
+p_volcano <- score_df_annotated %>%
+  ggplot(aes(x = logFC, y = -log10(p_value))) +
+  
+  # Add points colored by significance (raw p-values and logFC)
+  geom_point(aes(color = p_value < pval_threshold & abs(logFC) > logfc_threshold), 
+             alpha = 0.6, size = 1.5) +
+  
+  # Highlight top 10 upregulated and downregulated peaks with gene names
+  geom_text_repel(
+    data = top_peaks,
+    aes(label = SYMBOL),  # Use gene name for labeling
+    size = 3,
+    box.padding = 0.5,
+    point.padding = 0.5,
+    max.overlaps = Inf,
+    segment.color = 'black',
+    segment.size = 0.5
+  ) +
+  
+  # Add vertical lines for logFC thresholds
+  geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), 
+             linetype = "dashed", color = "darkred") +
+  
+  # Add horizontal line for raw p-value threshold
+  geom_hline(yintercept = -log10(pval_threshold), 
+             linetype = "dashed", color = "blue") +
+  
+  # Customize labels and theme
+  labs(
+    title = "Volcano Plot: Differential Peaks",
+    x = "Log2 Fold Change",
+    y = "-Log10 Raw P-value"
+  ) +
+  scale_color_manual(values = c("grey70", "red")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, size = 16))
+
+# Display plot
+p_volcano
+
+# Save the plot to a file
+ggsave(filename = "../../results/figures/chip_volcano.pdf", plot = p_volcano, width = 8, height = 6)
+
+```
+
+
+Let's also see where they are on the genome.
+```{r,fig.width=10}
+# Remove ".x" from column names
+colnames(score_df_annotated) <- gsub("\\.x$", "", colnames(score_df_annotated))
+
+# Filter valid chromosomes from score_df_annotated
+valid_chromosomes <- c(paste0("chr", 1:22), "chrX", "chrY")
+
+# Ensure chromosomes are ordered correctly (numerically and X/Y at the end)
+score_df_ordered <- score_df_annotated %>%
+  filter(seqnames %in% valid_chromosomes) %>%
+  mutate(
+    seqnames = factor(seqnames, levels = c(paste0("chr", 1:22), "chrX", "chrY"))
+  )
+
+# Filter the top peaks for the Manhattan plot
+top_peaks_manhattan <- score_df_ordered %>%
+  filter(!is.na(logFC)) %>%
+  arrange(adj_p_value) %>%
+  slice_head(n = 20)  # Take top 20 peaks (10 upregulated, 10 downregulated)
+
+# Create Manhattan plot with alternating colors for logFC
+p_manhattan <- top_peaks_manhattan %>%
+  ggplot(aes(x = start, y = -log10(p_value), color = logFC)) +
+
+  # Lollipop line from x-axis to each point
+  geom_segment(aes(x = start, xend = start, y = 0, yend = -log10(p_value)), color = "gray70") +
+  
+  # Points colored by logFC (dark red for negative, dark blue for positive)
+  geom_point(alpha = 0.8, size = 2) +
+  
+  # Label significant peaks with gene names using geom_text_repel
+  geom_text_repel(
+    aes(label = SYMBOL),
+    size = 3,
+    box.padding = 0.5,
+    point.padding = 0.5,
+    max.overlaps = 10,
+    segment.color = 'black',
+    segment.size = 0.5
+  ) +
+  
+  # Facet by chromosome, no free scales for x-axis
+  facet_wrap(~ seqnames, scales = "free_x", nrow = 1) +
+  
+  # Customize color gradient for logFC
+  scale_color_gradient2(
+    low = "darkred", mid = "grey80", high = "darkblue", midpoint = 0
+  ) +
+  
+  # Customize labels and theme
+  labs(
+    title = "Top Differential Peaks",
+    x = "Genomic Position",
+    y = "-log10(p-value)"
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+# Display the plot
+print(p_manhattan)
+
+# Save plot to file
+ggsave(filename = "../../results/figures/chip_chrom_top_differential_peaks.pdf", plot = p_manhattan, width = 10, height = 6)
+
+
+```
+
+Let's just check genes that are annotated for the top peaks:
+```{r}
+top_peaks %>% select(SYMBOL,logFC,p_value,adj_p_value) %>% print()
+```
+
+Upregulated peaks:
+
+1. **SESN1 (Sestrin 1)**:  
+Sestrin 1 is part of the sestrin family and is involved in the regulation of oxidative stress and mTOR signaling. It has been linked to tumor suppression in various cancers, including breast cancer. Upregulation of SESN1 could indicate a cellular response to stress or changes in metabolism induced by the knockdown of TACSTD2, which could affect survival pathways, especially in TNBC cells where oxidative stress is a key factor.
+
+2. **TENM3-AS2 (Teneurin Transmembrane Protein 3, antisense RNA 2)**:  
+This is a non-coding RNA with unclear function.
+
+3. **ARHGAP26 (Rho GTPase-activating protein 26)**:  
+ARHGAP26 is involved in cytoskeleton organization and cell motility, pathways that are often deregulated in cancers like TNBC, which are highly metastatic. This protein might play a role in the response to TACSTD2 knockdown by altering the cytoskeletal dynamics, which could affect migration or invasion.
+
+4. **SYCP1 (Synaptonemal Complex Protein 1)**:  
+This is typically involved in meiosis, but in cancer, the expression of meiotic genes is often deregulated. Its upregulation might reflect abnormal gene expression as the cell line responds to knockdown, possibly impacting genomic stability or cell cycle control, which are key factors in TNBC progression.
+
+5. **CUBN (Cubilin)**:  
+Cubilin is a receptor involved in endocytosis, including the uptake of proteins such as vitamin D-binding protein. It has been found to be overexpressed in some cancers and could be linked to nutrient uptake pathways. In TNBC cells, changes in CUBN expression might reflect shifts in metabolic processes triggered by TACSTD2 knockdown, which could impact cellular survival or growth.
+
+6. **CLVS2 (Clavesin 2)**:  
+CLVS2 is associated with endosome trafficking, and dysregulation of intracellular trafficking can be important in cancer progression. The knockdown of TACSTD2, a cell surface glycoprotein, might affect similar pathways, explaining CLVS2 upregulation.
+
+7. **RHBDD1 (Rhomboid domain-containing protein 1)**:  
+RHBDD1 is linked to apoptosis and may play a role in cell survival. Its upregulation in response to TACSTD2 knockdown might be connected to the regulation of apoptosis or stress response pathways, processes that are often altered in cancer cells to promote survival under adverse conditions.
+
+8. **KRT42P (Keratin 42, pseudogene)**:  
+As a pseudogene, KRT42P itself might not be functional, but its transcriptional activation could indicate broader deregulation of keratin genes. TACSTD2 knockdown might affect keratin-related pathways, particularly in epithelial cells such as breast cancer cells.
+
+9. **LOC101929485**:  
+This is an uncharacterized locus.
+
+10. **CFLAR-AS1 (CFLAR Antisense RNA 1)**:  
+CFLAR is involved in the regulation of apoptosis and NF-κB signaling, pathways critical for cancer cell survival. TACSTD2 knockdown might affect these pathways, especially in highly aggressive and apoptosis-resistant TNBC cells.
+
+Many of these genes seem to be involved in pathways related to apoptosis, cell motility, metabolism, and oxidative stress, which are highly relevant in cancers. Given **TACSTD2**'s role in promoting tumor growth and metastasis, these changes might reflect downstream effects of its knockdown, altering cell survival and metastatic potential in TNBC cells.
+
+Downregulated peaks:
+
+1. **SEMA3C (Semaphorin 3C)**:  
+Semaphorin 3C plays a role in cell migration, invasion, and angiogenesis, processes that are often heightened in TNBC. SEMA3C downregulation could suggest a reduction in invasive behavior or altered cell signaling in response to TACSTD2 knockdown.
+
+2. **CDC42EP4 (CDC42 Effector Protein 4)**:  
+CDC42EP4 regulates actin cytoskeleton reorganization, affecting cell shape and movement. Its downregulation may reflect reduced cell motility, which is critical for cancer metastasis, possibly attenuating the aggressive phenotype typical of TNBC.
+
+3. **GPX3 (Glutathione Peroxidase 3)**:  
+GPX3 is an antioxidant enzyme that protects cells from oxidative stress. Downregulation could indicate that cells are experiencing increased oxidative stress, which is common in cancer cells, especially when pathways related to cell survival or stress response (like those influenced by TACSTD2) are altered.
+
+4. **SLC45A4 (Solute Carrier Family 45 Member 4)**:  
+SLC45A4 is involved in transport processes across cell membranes. While its direct role in cancer is less clear, reduced expression may affect nutrient transport or cellular metabolism, which could influence cancer cell survival in nutrient-deprived environments like those typical of aggressive breast cancers.
+
+5. **SEMA5B (Semaphorin 5B)**:  
+Another member of the semaphorin family, SEMA5B is implicated in cell guidance and signaling. Its downregulation might further disrupt pathways related to cell migration and invasion, potentially reducing metastatic behavior in TACSTD2 knockdown cells.
+
+6. **IADEN (Intercellular Adhesion Endothelial Cell Protein)**:  
+IADEN is less well-characterized, but its name suggests a role in cell adhesion. A reduction in adhesion proteins can impact how cancer cells interact with their microenvironment, which may alter their ability to invade and metastasize.
+
+7. **TMX2-CTNND1 (TMX2-CTNND1 Fusion)**:  
+TMX2 is involved in oxidative stress, and CTNND1 (Catenin Delta-1) regulates cell-cell adhesion and signaling. This fusion gene's downregulation might disrupt these pathways, potentially affecting cancer cell adhesion and response to oxidative stress in TACSTD2 knockdown cells.
+
+8. **MIR595 (MicroRNA 595)**:  
+MicroRNA.
+
+9. **ETS2-AS1 (ETS2 Antisense RNA 1)**:  
+This antisense RNA regulates the expression of ETS2, a gene involved in cell cycle regulation and apoptosis.
+
+10. **PARD6B (Partitioning Defective 6 Homolog Beta)**:  
+PARD6B is involved in cell polarity and tight junction formation. In cancer, loss of cell polarity contributes to metastasis. Its downregulation might reflect altered cell polarity and junction integrity, which could affect the migration and invasive potential of the TNBC cells.
+
+
+Several downregulated genes are involved in key processes such as **cell motility, adhesion, oxidative stress response, and cell cycle regulation**. This fits with the hypothesis that **TACSTD2** knockdown might reduce the aggressiveness and metastatic potential of the TNBC 
+
+
+## Enhancers
+
+
+Finally, let's check out the top peaks labeled as distal intergenic, which could correspond to enhancers.
+
+```{r}
+top_ten_enhancers <- 
+  score_df_ordered %>% 
+  filter(annotation == "Distal Intergenic") %>% 
+  slice_head(n = 10)
+
+# Save to file
+saveRDS(top_ten_enhancers, file = "../../results/processed_data/top_enhancers.rds")
+
+top_ten_enhancers %>% 
+  select(SYMBOL, p_value, logFC)
+```
+
+Genes downregulated in the knockdown condition:
+
+1. **PARD6B** (*Par-6 Family Cell Polarity Regulator Beta*):
+Involved in maintaining cell polarity, which is crucial for proper cell adhesion and migration Downregulation could lead to disruption in cell adhesion, which aligns with reduced metastatic behavior. If cells are less able to maintain their polarity, they may have impaired motility, reducing their ability to spread.
+
+2. **GCNT1** (*Glucosaminyl (N-acetyl) Transferase 1*):
+Involved in glycosylation, a process that affects cell surface proteins, including those related to adhesion and signaling. Downregulation could reduce the cells' ability to migrate or interact with the tumor microenvironment, which supports the anti-metastatic effect expected from **TACSTD2** knockdown.
+
+3. **RAPH1** (*Ras Association and Pleckstrin Homology Domains 1*):
+Regulates cell migration and is linked to actin cytoskeleton dynamics. Downregulation aligns well with reduced cell migration, suggesting that **TACSTD2** knockdown is limiting the metastatic potential of the cells by decreasing the expression of genes involved in cell movement.
+
+4. **HS3ST1** (*Heparan Sulfate-Glucosamine 3-Sulfotransferase 1*):
+Modifies heparan sulfate proteoglycans, affecting cell signaling pathways related to growth and invasion. Downregulation of this gene suggests a reduction in cell communication through heparan sulfate pathways, potentially impairing growth factor signaling that is often critical in cancer cell proliferation and metastasis.
+
+5. **IADEN** (*Inter-alpha-Trypsin Inhibitor Heavy Chain 1 Pseudogene*):
+Pseudogene.
+
+6. **SEMA3C** (*Semaphorin 3C*):
+Often associated with axon guidance and cellular movement. Semaphorins are sometimes linked to cancer cell migration. Reduced expression of could contribute to diminished invasive capacity, which is consistent with TACSTD2 knockdown reducing metastasis.
+
+Genes upregulated in the knockdown condition:
+
+1. **BICRA** (*BRD4-Interacting Chromatin Remodeler Associated*):
+Involved in chromatin remodeling, which affects gene transcription. Upregulation of chromatin remodelers could indicate cellular attempts to reorganize the genome in response to the knockdown. This could be part of a broader compensatory mechanism in response to the loss of TACSTD2, as the cells may be adjusting their transcriptional landscape to survive despite reduced invasive potential.
+
+2. **IRF2BP2** (*Interferon Regulatory Factor 2 Binding Protein 2*):
+Plays a role in immune response regulation and could modulate transcription. Upregulation may indicate a shift towards anti-inflammatory or immune-modulatory processes, potentially making the cells more resistant to immune detection as they adjust to the knockdown.
+
+## Issues
+
+This analysis has limitations, primarily due to the low sample size (only two samples per condition), which reduces statistical power and leads to high p-values and unreliable results. Additionally, the t-test approach may not fully capture the complexity of ChIP-seq data, as it doesn't account for variability in peak shapes and enrichment across replicates. Ideally, a dedicated tool like DiffBind should be used for differential peak analysis, as it is specifically designed to handle the unique characteristics of ChIP-seq data, incorporating biological replicates and providing more accurate statistical assessments of differential binding.

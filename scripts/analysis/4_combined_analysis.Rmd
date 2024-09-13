@@ -1,0 +1,72 @@
+---
+title: "Combined analysis of Chip and RNA-seq"
+author: "Angelo Limeta"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    theme: "journal"
+editor_options:
+  chunk_output_type: inline
+always_allow_html: true
+---
+
+## Load Libraries
+```{r}
+library(tidyverse)
+
+select = dplyr::select
+```
+
+## Load data
+```{r}
+tbl_meta <- readRDS(file = "../../results/processed_data/tbl_meta.rds")
+tbl_rna <- readRDS(file = "../../results/processed_data/tbl_rna_cpm_with_meta.rds")
+top_enhancers <- readRDS(file = "../../results/processed_data/top_enhancers.rds")
+
+head(tbl_meta)
+head(tbl_rna)
+head(top_enhancers)
+```
+
+## Plot enhancer controlled gene expression
+
+In this final quick analysis, I will simply check if the upregulation/downregulation of the predicted enhancer peaks correspond to a change in expression levels of their corrresponding gene.
+
+```{r}
+# Extract info from enhancer data
+enhancer_ids <- top_enhancers$SYMBOL
+
+tbl_rna_enh <- 
+  tbl_rna %>% 
+  filter(symbol %in% enhancer_ids)
+
+tbl_rna_enh
+```
+
+Only one enhancer-gene is detected in the rna-seq data (PARD6B). Let's check its expression.
+```{r}
+p_PARD6B <- 
+  tbl_rna_enh %>%
+  ggplot(aes(x = condition,y = cpm, color = condition)) +
+  geom_point() +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        legend.position = "none") +
+  scale_color_manual(values = c("grey60","darkred")) +
+  labs(title = "RNA expression of PARD6B",
+       x = "",
+       y = "CPM")
+
+p_PARD6B
+
+ggsave(p_PARD6B,filename = "../../results/figures/combined_PARD6B_expression_rna.pdf")
+  
+```
+
+In the Chip-data, this enhancer peak is downregulated in the KD condition, and this is also the case for the expression in the RNA-seq samples.
+
+**PARD6B** (*Par-6 Family Cell Polarity Regulator Beta*):
+Involved in maintaining cell polarity, which is crucial for proper cell adhesion and migration Downregulation could lead to disruption in cell adhesion, which aligns with reduced metastatic behavior. If cells are less able to maintain their polarity, they may have impaired motility, reducing their ability to spread.
